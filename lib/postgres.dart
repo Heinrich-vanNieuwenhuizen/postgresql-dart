@@ -226,6 +226,14 @@ abstract class Connection implements Session, SessionExecutor {
 
   ConnectionInfo get info;
   Channels get channels;
+
+  static Future<Connection> openWebSocket(
+    Endpoint endpoint, {
+    ConnectionSettings? settings,
+  }) {
+    return PgConnectionImplementation.webConnect(endpoint,
+        connectionSettings: settings);
+  }
 }
 
 abstract class ResultStream implements Stream<ResultRow> {

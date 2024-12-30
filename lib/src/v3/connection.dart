@@ -9,6 +9,8 @@ import 'package:charcode/ascii.dart';
 import 'package:meta/meta.dart';
 import 'package:pool/pool.dart' as pool;
 import 'package:stream_channel/stream_channel.dart';
+import 'package:web_socket_channel/status.dart' as status;
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../postgres.dart';
 import '../auth/auth.dart';
@@ -262,6 +264,117 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
         sink.add(msg);
       }),
     ));
+  }
+
+  static Future<(StreamChannel<Message>, bool)> _webConnect(
+    Endpoint endpoint,
+    ResolvedConnectionSettings settings, {
+    required CodecContext codecContext,
+    StreamTransformer<Uint8List, Uint8List>? incomingBytesTransformer,
+  }) async {
+    final host = endpoint.host;
+    final port = endpoint.port;
+    final wsUrl = Uri.parse('ws://$host:$port');
+
+    final channel = WebSocketChannel.connect(
+      wsUrl,
+    );
+
+    await channel.ready.timeout(settings.connectTimeout);
+
+    final sslCompleter = Completer<int>();
+    // ignore: cancel_subscriptions
+    final subscription = channel.stream.cast<Uint8List>().listen(
+      (data) {
+        if (sslCompleter.isCompleted) {
+          return;
+        }
+        if (data.length != 1) {
+          sslCompleter.completeError(PgException(
+              'Could not initialize SSL connection, received unknown byte stream.'));
+          return;
+        }
+
+        sslCompleter.complete(data.first);
+      },
+      onDone: () {
+        if (sslCompleter.isCompleted) {
+          return;
+        }
+        sslCompleter.completeError(PgException(
+            'Could not initialize SSL connection, connection closed during handshake.'));
+      },
+      onError: (e) {
+        if (sslCompleter.isCompleted) {
+          return;
+        }
+        sslCompleter.completeError(e);
+      },
+    );
+
+    Stream<Uint8List> adaptedStream;
+    var secure = false;
+
+    if (settings.sslMode != SslMode.disable) {
+      throw PgException('Server does not support SSL, but it was required.');
+    }
+
+    // if (settings.sslMode != SslMode.disable) {
+    //   // Query if SSL is possible by sending a SSLRequest message
+    //   final byteBuffer = ByteData(8);
+    //   byteBuffer.setUint32(0, 8);
+    //   byteBuffer.setUint32(4, 80877103);
+    //   channel.sink.add(byteBuffer.buffer.asUint8List());
+    //
+    //   final byte = await sslCompleter.future.timeout(settings.connectTimeout);
+    //
+    //   if (byte == $S) {
+    //     // SSL is supported, upgrade!
+    //     subscription.pause();
+    //
+    //     socket = await SecureSocket.secure(
+    //       socket,
+    //       context: settings.securityContext,
+    //       onBadCertificate: settings.sslMode.ignoreCertificateIssues
+    //           ? (_) => true
+    //           : (c) => throw BadCertificateException(c),
+    //     ).timeout(settings.connectTimeout);
+    //     secure = true;
+    //
+    //     // We can listen to the secured socket again, the existing subscription is
+    //     // ignored.
+    //     adaptedStream = socket;
+    //   } else {
+    //     // This server does not support SSL
+    //     throw PgException('Server does not support SSL, but it was required.');
+    //   }
+    // } else {
+    //   // We've listened to the stream already and sockets are single-subscription
+    //   // streams. Expose it as a new stream.
+    //   adaptedStream = async.SubscriptionStream(subscription);
+    // }
+
+    adaptedStream = async.SubscriptionStream(subscription);
+
+    if (incomingBytesTransformer != null) {
+      adaptedStream = adaptedStream.transform(incomingBytesTransformer);
+    }
+
+    final outgoingSocket = async.StreamSinkExtensions(channel.sink)
+        .transform<Uint8List>(
+            async.StreamSinkTransformer.fromHandlers(handleDone: (out) {
+      // As per the stream channel's guarantees, closing the sink should close
+      // the channel in both directions.
+      // socket.destroy();
+      channel.sink.close(status.goingAway);
+      return out.close();
+    }));
+
+    return (
+      StreamChannel<List<int>>(adaptedStream, outgoingSocket)
+          .transform(messageTransformer(codecContext)),
+      secure,
+    );
   }
 
   static Future<(StreamChannel<Message>, bool)> _connect(
@@ -636,6 +749,50 @@ class PgConnectionImplementation extends _PgSessionBase implements Connection {
     ));
     // Waiting for the server to close connection.
     await channel.stream.listen((_) {}).asFuture();
+  }
+
+  static Future<PgConnectionImplementation> webConnect(
+    Endpoint endpoint, {
+    ConnectionSettings? connectionSettings,
+    @visibleForTesting
+    StreamTransformer<Uint8List, Uint8List>? incomingBytesTransformer,
+  }) async {
+    final settings = connectionSettings is ResolvedConnectionSettings
+        ? connectionSettings
+        : ResolvedConnectionSettings(connectionSettings, null);
+    final codecContext = CodecContext(
+      connectionInfo: ConnectionInfo(),
+      // TODO: share this between pooled connections
+      databaseInfo: DatabaseInfo(),
+      encoding: settings.encoding,
+      typeRegistry: settings.typeRegistry,
+    );
+    var (channel, secure) = await _webConnect(
+      endpoint,
+      settings,
+      codecContext: codecContext,
+      incomingBytesTransformer: incomingBytesTransformer,
+    );
+
+    channel = _debugChannel(channel);
+
+    if (settings.transformer != null) {
+      channel = channel.transform(settings.transformer!);
+    }
+
+    final connection = PgConnectionImplementation._(
+      endpoint,
+      settings,
+      channel,
+      secure,
+      databaseInfo: codecContext.databaseInfo,
+      info: codecContext.connectionInfo,
+    );
+    await connection._startup();
+    if (connection._settings.onOpen != null) {
+      await connection._settings.onOpen!(connection);
+    }
+    return connection;
   }
 }
 

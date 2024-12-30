@@ -1,8 +1,9 @@
-import 'dart:convert' hide Codec;
 import 'dart:convert' as convert;
-import 'dart:typed_data';
+import 'dart:convert' hide Codec;
+import 'dart:typed_data' hide ByteData;
 
 import 'package:buffer/buffer.dart';
+import 'package:postgres/community/byte_data.dart';
 
 import '../buffer.dart';
 import '../types.dart';
